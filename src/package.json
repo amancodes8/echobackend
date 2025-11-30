@@ -21,6 +21,7 @@
     "express": "^4.21.2",
     "form-data": "^4.0.5",
     "jsonwebtoken": "^9.0.0",
+    "lingo.dev": "^0.117.6",
     "mongoose": "^7.3.1",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",

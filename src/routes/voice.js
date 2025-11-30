@@ -1,13 +1,9 @@
 // backend/src/routes/voice.js
 /**
- * backend/src/routes/voice.js
- *
- * Gemini-only backend (no attempt to generate audio via Gemini).
- * - Audio -> STT via Gemini (transcription)
- * - Text  -> Reply via Gemini (text only)
- *
- * NOTE: If you want audio replies, enable a TTS provider (Google Cloud TTS, ElevenLabs, etc.)
- * and I can add that code. For now we return replyText and audioBase64=null.
+ * /api/voice — Gemini + (optional) Lingo.dev
+ * - Audio (multipart) -> Gemini STT -> { transcript }
+ * - Text (JSON) -> Gemini Chat -> { replyText, replyTextUserLanguage? }
+ *   Accepts `selectedMode` in JSON to switch system prompt tone.
  */
 
 const express = require("express");
@@ -18,101 +14,144 @@ const router = express.Router();
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 if (!process.env.GEMINI_API_KEY) {
-  console.error("Missing GEMINI_API_KEY in env — set GEMINI_API_KEY in backend .env");
+  console.warn("Missing GEMINI_API_KEY in .env");
 }
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-/* ---------------------------------------------------------
-   Gemini STT (speech -> text)
-   We'll ask Gemini to transcribe the inline audio.
-   If this fails for your account/region, you can replace STT
-   with a dedicated STT provider later.
---------------------------------------------------------- */
+// (Optional) Lingo.dev initialization — unchanged from prior setup
+let lingo = null;
+if (process.env.LINGODOTDEV_API_KEY) {
+  try {
+    const { LingoDotDevEngine } = require("lingo.dev/sdk");
+    lingo = new LingoDotDevEngine({ apiKey: process.env.LINGODOTDEV_API_KEY });
+    console.log("Lingo.dev initialized");
+  } catch (e) {
+    console.warn("Failed to init lingo.dev:", e?.message || e);
+    lingo = null;
+  }
+}
+
+/* -------------------------
+   Modes (system prompts)
+--------------------------*/
+const modes = {
+  calm: "You are a gentle, slow, calming wellbeing companion. Use soft reassuring language, short sentences, and suggest breathing or grounding when appropriate.",
+  motivate: "You are energetic, uplifting, and encouraging. Use motivating language, positive affirmations, and short actionable steps.",
+  grounding: "You give short, simple grounding prompts and quick exercises to stabilize attention. Keep responses short (1-2 sentences).",
+};
+
+// Helpers for lingo (no-op if lingo absent)
+async function lingoTranslateToEnglish(text) {
+  if (!lingo) return text;
+  try { return (await lingo.localizeText(text, { targetLocale: "en" })) || text; } catch (e) { return text; }
+}
+async function lingoTranslateToTarget(text, targetLocale) {
+  if (!lingo) return null;
+  try { return (await lingo.localizeText(text, { targetLocale })) || null; } catch (e) { return null; }
+}
+
+function pickUserLocale(req) {
+  const header = (req.headers["accept-language"] || "").toString();
+  if (!header) return "en";
+  const first = header.split(",")[0].split(";")[0].trim();
+  return first || "en";
+}
+
+/* -------------------------
+   Gemini STT (inline audio)
+--------------------------*/
 async function geminiSTT(buffer) {
   const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-  // Use inline data pattern: prompt + inline audio
-  // We ask Gemini to "transcribe this audio to English."
-  const prompt = "Transcribe the following audio into English text (accurate punctuation).";
-
-  // The SDK accepts an array of inputs; using the simpler shape that worked earlier:
-  const result = await model.generateContent([
-    prompt,
+  const resp = await model.generateContent([
+    "Transcribe the following audio to text. If the audio is not English, transcribe it in the original language.",
     {
-      inlineData: {
-        mimeType: "audio/webm",
+      inline_data: {
+        mime_type: "audio/webm",
         data: buffer.toString("base64"),
       },
     },
   ]);
 
-  // result.response.text() returns the transcription text
-  const respText = result?.response?.text ? result.response.text() : "";
-  return respText;
+  return resp?.response?.text ? resp.response.text() : "";
 }
 
-/* ---------------------------------------------------------
-   Gemini Chat (text -> reply)
---------------------------------------------------------- */
-async function geminiChat(text, history = []) {
+/* -------------------------
+   Gemini Chat (uses selectedMode system prompt)
+   Accepts mode key (calm|motivate|grounding)
+--------------------------*/
+async function geminiChat(text, history = [], mode = "calm") {
   const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+
+  const systemPrompt = modes[mode] || modes.calm;
 
   const historyText = Array.isArray(history)
     ? history.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`).join("\n")
     : "";
 
   const prompt = `
-You are a compassionate, concise mental-wellbeing assistant.
-Conversation so far:
+SYSTEM:
+${systemPrompt}
+
+Conversation:
 ${historyText}
 
 User: ${text}
 
-Reply in a supportive, concise way (2-4 sentences).
+Reply in a supportive manner appropriate to the system instructions. Keep replies concise.
 `;
 
   const result = await model.generateContent([prompt]);
-  const reply = result?.response?.text ? result.response.text() : "";
-  return reply;
+  return result?.response?.text ? result.response.text() : "";
 }
 
-/* ---------------------------------------------------------
-   Main route: accepts multipart/form-data (file) OR JSON { text }
---------------------------------------------------------- */
+/* -------------------------
+   Routes
+--------------------------*/
 router.post("/", upload.single("file"), async (req, res) => {
   try {
-    // AUDIO MODE: file present -> transcribe
+    // AUDIO MODE -> transcribe
     if (req.file) {
       const buffer = req.file.buffer;
       try {
         const transcript = await geminiSTT(buffer);
         return res.json({ success: true, transcript });
       } catch (e) {
-        console.error("geminiSTT error:", e?.message || e);
+        console.error("geminiSTT error:", e);
         return res.status(500).json({ success: false, error: "Transcription failed", details: String(e?.message || e) });
       }
     }
 
-    // TEXT MODE: JSON body { text, history? } -> reply text
+    // JSON TEXT MODE -> chat
     if (req.is("application/json")) {
-      const { text, history = [] } = req.body || {};
+      const { text, history = [], selectedMode } = req.body || {};
       if (!text) return res.status(400).json({ success: false, error: "Missing text" });
 
+      // translate to English for LLM if lingo available
+      const englishText = await lingoTranslateToEnglish(text);
+
+      let replyEnglish;
       try {
-        const replyText = await geminiChat(text, history);
-        // No TTS here — return audioBase64: null to make frontend handling explicit
-        return res.json({ success: true, replyText, audioBase64: null });
+        replyEnglish = await geminiChat(englishText, history, selectedMode || "calm");
       } catch (e) {
-        console.error("geminiChat error:", e?.message || e);
+        console.error("geminiChat error:", e);
         return res.status(500).json({ success: false, error: "LLM reply failed", details: String(e?.message || e) });
       }
+
+      // translate back to user's locale if lingo available
+      const userLocale = pickUserLocale(req);
+      const replyUserLang = lingo ? await lingoTranslateToTarget(replyEnglish, userLocale) : null;
+
+      return res.json({
+        success: true,
+        replyText: replyEnglish,
+        replyTextUserLanguage: replyUserLang,
+      });
     }
 
-    // fallback
-    return res.status(400).json({ success: false, error: "Bad request format" });
+    return res.status(400).json({ success: false, error: "Invalid request format" });
   } catch (err) {
-    console.error("voice route unhandled error:", err);
+    console.error("voice route error:", err);
     return res.status(500).json({ success: false, error: String(err?.message || err) });
   }
 });
